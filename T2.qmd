@@ -1,0 +1,372 @@
+---
+title: "T2"
+author: "Abraham Majluf, Izzy Tice, Rubén Figueroa"
+format: html
+editor: visual
+---
+
+```{r, echo = FALSE, include = FALSE}
+library(here)
+library(tidyverse)
+set.seed(12345)
+
+# load population & employment dbs
+pop_db <- read_csv(here("model",
+                        "inputs",
+                        "zonal",
+                        "ma_population_run97-176_2019_v20240109.csv"))
+
+emp_db <- read_csv(here("model",
+                        "inputs",
+                        "zonal",
+                        "ma_employment_run97-176_2019_v20240109.csv"))
+
+# identify low income population
+mod_pop_db <- pop_db |>
+  filter(is_worker==1) |>
+  mutate(low_inc = case_when(wage_inc < 20000 ~ 1,
+                              TRUE ~ 0))
+
+# undocumented is the whole construction sector
+undoc <- sum(emp_db$`1_constr`)
+
+# undocumented as share of low income population
+undoc_in_low_inc <- undoc/sum(mod_pop_db$low_inc)
+
+# random undocumented status assignment 
+mod_pop_db <- mod_pop_db |>
+  filter(low_inc == 1) |>
+  mutate(undoc =  rbinom(n(), size = 1, prob = undoc_in_low_inc)) |>
+  mutate(unique_id = paste0(hid, person_num)) |>
+  select(unique_id, undoc)
+
+# join database
+pop_db <- pop_db |>
+  mutate(unique_id = paste0(hid, person_num)) |>
+  left_join(mod_pop_db, by = "unique_id") |>
+  mutate(undoc = replace_na(undoc, 0))
+
+# exclude undoc in final db
+pop_db_alternative <- pop_db |>
+  filter(undoc == 0) |>
+  select(-unique_id, -undoc)
+
+# new household count per block
+household_per_block <- pop_db_alternative |>
+  group_by(block_id) |>
+  summarise(total_households_new = n_distinct(hid)) 
+
+# join database and eliminate undoc employment in construction
+emp_db_alternative <- emp_db |>
+  select(-total_households) |>
+  left_join(household_per_block, by = "block_id") |>
+  mutate(total_households = replace_na(total_households_new,0)) |>
+  select(-total_households_new) |>
+  mutate(`1_constr`=0) |>
+  mutate(total_jobs = rowSums(across(2:11)))
+
+# write csvs
+write_csv(emp_db_alternative, here("model", "inputs", "zonal", "ma_employment_alternative.csv"))
+
+write_csv(pop_db_alternative, here("model", "inputs", "zonal", "ma_population_alternative.csv"))
+```
+
+## Trip Generation Comparison
+
+```{r, echo = FALSE, include = FALSE}
+# Libraries for analysis:
+library(tidyverse)
+library(sf)
+library(DBI)
+library(here)
+library(leaflet)
+library(maptiles)
+library(tidyterra)
+library(knitr)
+library(tigris)
+
+sf::sf_use_s2(FALSE)
+```
+
+### Trip Production:
+
+First, we load the output from TransCAD for both the base and alternative scenarios:
+
+```{r, echo = FALSE}
+# Transcad output:
+## Base scenario:
+base_db <- dbConnect(drv=RSQLite::SQLite(), 
+                     dbname=here("model",
+                                 "outputs",
+                                 "Base",
+                                 "tdm23.db"))
+
+base_trip_prod <- dbGetQuery(base_db, 'SELECT * FROM trip_prod')
+
+dbDisconnect(base_db)
+
+## Alternative scenario:
+alt_db <- dbConnect(drv=RSQLite::SQLite(), 
+                     dbname=here("model",
+                                 "outputs",
+                                 "Alternative",
+                                 "tdm23.db"))
+
+alt_trip_prod <- dbGetQuery(alt_db, 'SELECT * FROM trip_prod')
+
+dbDisconnect(alt_db)
+```
+
+Now we analyze the differences between scenarios for trip production:
+
+```{r}
+# Agregate trip productions on the block level:
+## Base scenario:
+base_block_prod <- base_trip_prod |>
+  replace_na(list(hbw_p = 0,
+                  hbsc_p = 0,
+                  hbsr_p = 0,
+                  hbpb_p = 0,
+                  nhbw_p = 0,
+                  nhbnw_p = 0)) |>
+  group_by(block_id) |>
+  summarise(hbw_p = sum(hbw_p),
+            hbsc_p = sum(hbsc_p),
+            hbsr_p = sum(hbsr_p),
+            hbpb_p = sum(hbpb_p),
+            nhbw_p = sum(nhbw_p),
+            nhbnw_p = sum(nhbnw_p))
+
+# Alternative scenario:
+alt_block_prod <- alt_trip_prod |>
+  replace_na(list(hbw_p = 0,
+                  hbsc_p = 0,
+                  hbsr_p = 0,
+                  hbpb_p = 0,
+                  nhbw_p = 0,
+                  nhbnw_p = 0)) |>
+  group_by(block_id) |>
+  summarise(hbw_p_alt = sum(hbw_p),
+            hbsc_p_alt = sum(hbsc_p),
+            hbsr_p_alt = sum(hbsr_p),
+            hbpb_p_alt = sum(hbpb_p),
+            nhbw_p_alt = sum(nhbw_p),
+            nhbnw_p_alt = sum(nhbnw_p))
+
+# Define the tolerance for difference identification:
+tolerance <- 0.75
+
+# Compute differences in trip generation:
+compare_prod <- full_join(base_block_prod, alt_block_prod) |>
+  mutate(dif_hbw_p = hbw_p_alt - hbw_p,
+         dif_hbsc_p = hbsc_p_alt - hbsc_p,
+         dif_hbsr_p = hbsr_p_alt - hbsr_p,
+         dif_hbpb_p = hbpb_p_alt - hbpb_p) |>
+  filter(abs(dif_hbw_p)/hbw_p > tolerance |
+         abs(dif_hbsc_p)/hbsc_p > tolerance |
+         abs(dif_hbsr_p)/hbsr_p > tolerance |
+         abs(dif_hbpb_p)/hbpb_p > tolerance)
+
+# Graphical analysis:
+ma_blocks <- blocks(state = "MA", 
+                          year = 2010,
+                          progress_bar = FALSE) |>
+  st_transform("WGS84") |>
+  rename(block_id = GEOID10) |>
+  select(block_id)
+
+TAZs <- here("model",
+             "inputs",
+             "zonal",
+             "shp",
+             "CTPS_TDM23_TAZ_2017g_v202303.shp") |>
+  st_read(quiet = TRUE) |>
+  st_transform("WGS84") |>
+  mutate(block_id = as.character(taz_id)) |>
+  select(block_id)
+
+zones <- rbind(ma_blocks, TAZs)
+
+dif_blocks_prod <- zones |>
+  right_join(compare_prod) 
+
+hb_prod_labels <- paste0(formatC(dif_blocks_prod$dif_hbw_p, format = "f", digits = 2),
+                        " change in HBW trips<br/>",
+                        formatC(dif_blocks_prod$dif_hbsc_p, format = "f", digits = 2), 
+                        " change in HB-school trips<br/>",
+                        formatC(dif_blocks_prod$dif_hbsr_p, format = "f", digits = 2),
+                        " change in HB-soc/rec trips<br/>",
+                        formatC(dif_blocks_prod$dif_hbpb_p, format = "f", digits = 2),
+                         " change in HB-per-bus") |>
+  lapply(htmltools::HTML)
+
+leaflet(dif_blocks_prod) |>
+  addProviderTiles(provider = "CartoDB.Positron") |>
+  addPolygons(weight = 2,
+              color = "darkred",
+              fillColor = "darkred",
+              fillOpacity = 0.1,
+              highlightOptions = highlightOptions(weight = 3,
+                                                  fillOpacity = 0.5),
+              label = hb_prod_labels)
+```
+
+### Trip Attraction:
+
+First, we load the output from TransCAD for both the base and alternative scenarios:
+
+```{r, echo = FALSE}
+# Transcad output:
+## Base scenario:
+base_db <- dbConnect(drv=RSQLite::SQLite(), 
+                     dbname=here("model",
+                                 "outputs",
+                                 "Base",
+                                 "tdm23.db"))
+
+base_trip_attr <- dbGetQuery(base_db, 'SELECT * FROM trip_attr')
+
+dbDisconnect(base_db)
+
+## Alternative scenario:
+alt_db <- dbConnect(drv=RSQLite::SQLite(), 
+                     dbname=here("model",
+                                 "outputs",
+                                 "Alternative",
+                                 "tdm23.db"))
+
+alt_trip_attr <- dbGetQuery(alt_db, 'SELECT * FROM trip_attr') |>
+  rename_with(~ paste0("alt_", .x),
+              ends_with("_a")) 
+
+dbDisconnect(alt_db)
+```
+
+Now we analyze the differences between scenarios for trip attraction:
+
+```{r}
+# Define the tolerance for difference identification:
+tolerance <- 0.75
+
+# Compute differences in trip generation:
+compare_attr <- full_join(base_trip_attr, alt_trip_attr) |>
+  mutate(diff_hbw_inc1_a = alt_hbw_inc1_a - hbw_inc1_a,
+         diff_hbw_inc2_a = alt_hbw_inc2_a - hbw_inc2_a,
+         diff_hbw_inc3_a = alt_hbw_inc3_a - hbw_inc3_a,
+         diff_hbw_inc4_a = alt_hbw_inc4_a - hbw_inc4_a,
+         diff_hbsr_a = alt_hbsr_a - hbsr_a,
+         diff_hbsc_a = alt_hbsc_a - hbsc_a,
+         diff_hbpb_a = alt_hbpb_a - hbpb_a,
+         diff_nhbw_a = alt_nhbw_a - nhbw_a,
+         diff_nhbnw_a = alt_nhbnw_a - nhbnw_a) |>
+  filter(abs(diff_hbw_inc1_a)/hbw_inc1_a > tolerance |
+           abs(diff_hbw_inc2_a)/hbw_inc2_a > tolerance |
+           abs(diff_hbw_inc3_a)/hbw_inc3_a > tolerance |
+           abs(diff_hbw_inc4_a)/hbw_inc4_a > tolerance |
+           abs(diff_hbsc_a)/hbsc_a > tolerance |
+           abs(diff_hbsr_a)/hbsr_a > tolerance |
+           abs(diff_hbpb_a)/hbpb_a > tolerance |
+           abs(diff_nhbw_a)/nhbw_a > tolerance |
+           abs(diff_nhbnw_a)/nhbnw_a > tolerance)
+
+# Graphical analysis:
+dif_blocks_attr <- zones |>
+  right_join(compare_attr) 
+
+attr_labels <- paste0(formatC(dif_blocks_attr$diff_hbw_inc1_a, format = "f", digits = 2),
+                        " change in HBW trips (< $35k)<br/>",
+                      formatC(dif_blocks_attr$diff_hbw_inc2_a, format = "f", digits = 2),
+                        " change in HBW trips ($35k - $65k)<br/>",
+                      formatC(dif_blocks_attr$diff_hbw_inc3_a, format = "f", digits = 2),
+                        " change in HBW trips ($65k - $100k)<br/>",
+                      formatC(dif_blocks_attr$diff_hbw_inc4_a, format = "f", digits = 2),
+                        " change in HBW trips (> $100k)<br/>",
+                        formatC(dif_blocks_attr$diff_hbsc_a, format = "f", digits = 2), 
+                        " change in HB-school trips<br/>",
+                        formatC(dif_blocks_attr$diff_hbsr_a, format = "f", digits = 2),
+                        " change in HB-soc/rec trips<br/>",
+                        formatC(dif_blocks_attr$diff_hbpb_a, format = "f", digits = 2),
+                         " change in HB-per-bus<br/>",
+                      formatC(dif_blocks_attr$diff_nhbw_a, format = "f", digits = 2),
+                        " non-home-based work trips<br/>",
+                      formatC(dif_blocks_attr$diff_nhbnw_a, format = "f", digits = 2),
+                        " change in non-home-based non-work trips") |>
+  lapply(htmltools::HTML)
+
+leaflet(dif_blocks_attr) |>
+  addProviderTiles(provider = "CartoDB.Positron") |>
+  addPolygons(weight = 2,
+              color = "darkred",
+              fillColor = "darkred",
+              fillOpacity = 0.1,
+              highlightOptions = highlightOptions(weight = 3,
+                                                  fillOpacity = 0.5),
+              label = attr_labels)
+```
+
+### Non-home-based trip productions
+
+First, we load the output from TransCAD for both the base and alternative scenarios:
+
+```{r, echo = FALSE}
+# Transcad output:
+## Base scenario:
+base_db <- dbConnect(drv=RSQLite::SQLite(), 
+                     dbname=here("model",
+                                 "outputs",
+                                 "Base",
+                                 "tdm23.db"))
+
+base_trip_nhb <- dbGetQuery(base_db, 'SELECT * FROM prod_nhb')
+
+dbDisconnect(base_db)
+
+## Alternative scenario:
+alt_db <- dbConnect(drv=RSQLite::SQLite(), 
+                     dbname=here("model",
+                                 "outputs",
+                                 "Alternative",
+                                 "tdm23.db"))
+
+alt_trip_nhb <- dbGetQuery(alt_db, 'SELECT * FROM prod_nhb') |>
+  rename_with(~ paste0("alt_", .x),
+              ends_with("_p"))  
+
+dbDisconnect(alt_db)
+```
+
+Now we analyze the differences between scenarios for non-home based trip production:
+
+```{r}
+# Define the tolerance for difference identification:
+tolerance <- 0.75
+
+# Compute differences in trip generation:
+compare_nhb <- full_join(base_trip_nhb, alt_trip_nhb) |>
+  mutate(diff_nhbw_p = alt_nhbw_p - nhbw_p,
+         diff_nhbnw_p = alt_nhbnw_p - nhbnw_p) |>
+  filter(abs(diff_nhbw_p)/nhbw_p > tolerance |
+           abs(diff_nhbnw_p)/nhbnw_p > tolerance)
+
+# Graphical analysis:
+dif_blocks_nhb <- zones |>
+  right_join(compare_nhb) 
+
+nhb_labels <- paste0(formatC(dif_blocks_nhb$diff_nhbw_p, format = "f", digits = 2),
+                        " non-home-based work trips<br/>",
+                      formatC(dif_blocks_nhb$diff_nhbnw_p, format = "f", digits = 2),
+                        " change in non-home-based non-work trips") |>
+  lapply(htmltools::HTML)
+
+leaflet(dif_blocks_nhb) |>
+  addProviderTiles(provider = "CartoDB.Positron") |>
+  addPolygons(weight = 2,
+              color = "darkred",
+              fillColor = "darkred",
+              fillOpacity = 0.1,
+              highlightOptions = highlightOptions(weight = 3,
+                                                  fillOpacity = 0.5),
+              label = nhb_labels)
+```
+
+End of project.
